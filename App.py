@@ -10,41 +10,23 @@ import requests
 import streamlit as st
 
 # =========================================================
-# Auth models & helpers (cPanel + 20i style)
+# Auth & utility
 # =========================================================
 
-class AuthMethod:
-    CPANEL = "cPanel UAPI (cpanel user:token)"
-    TWENTYI_API = "20i Reseller API (Bearer token)"
-    CUSTOM_BEARER = "Generic Bearer token"
-
-
 def b64(s: str) -> str:
-    """Base64-encode a UTF‑8 string."""
     return base64.b64encode(s.encode("utf-8")).decode("ascii")
 
 
 def make_20i_bearer(api_key: str) -> str:
-    """
-    Build an Authorization: Bearer <base64> header for 20i.
-
-    Per your example:
-    - General API key: cbed8b5d17b3ed4fd
-    - OAuth client key: cbd1f37b39f284148
-    - Combined: cbed8b5d17b3ed4fd+cbd1f37b39f284148
-    Header uses base64 of the relevant token.
-    """
     return f"Bearer {b64(api_key)}"
 
 
 def generate_strong_password(length: int = 16) -> str:
-    """Generate a strong random password."""
     chars = string.ascii_letters + string.digits + "!@#$%^&*"
     return "".join(random.choice(chars) for _ in range(length))
 
 
 def normalize_subdomain_name(name: str) -> str:
-    """Normalize subdomain name into DNS-safe, cPanel-friendly form."""
     name = name.strip().lower()
     name = re.sub(r"[^a-z0-9-]", "-", name)
     name = re.sub(r"-{2,}", "-", name)
@@ -53,39 +35,65 @@ def normalize_subdomain_name(name: str) -> str:
 
 
 def update_wp_config(config_content: str, db_name: str, db_user: str, db_password: str) -> str:
-    """Patch DB_NAME / DB_USER / DB_PASSWORD defines in wp-config.php text."""
     patterns = {
         "DB_NAME": r"(define\s*\(\s*['\"]DB_NAME['\"]\s*,\s*['\"]).*?(['\"]\s*\);)",
         "DB_USER": r"(define\s*\(\s*['\"]DB_USER['\"]\s*,\s*['\"]).*?(['\"]\s*\);)",
         "DB_PASSWORD": r"(define\s*\(\s*['\"]DB_PASSWORD['\"]\s*,\s*['\"]).*?(['\"]\s*\);)",
     }
-    replacements = {
-        "DB_NAME": db_name,
-        "DB_USER": db_user,
-        "DB_PASSWORD": db_password,
-    }
-
+    rep = {"DB_NAME": db_name, "DB_USER": db_user, "DB_PASSWORD": db_password}
     new_content = config_content
-    for const, pattern in patterns.items():
-        val = replacements[const]
-        new_content = re.sub(pattern, r"\g<1>" + val + r"\g<2>", new_content, flags=re.IGNORECASE)
+    for c, p in patterns.items():
+        v = rep[c]
+        new_content = re.sub(p, r"\g<1>" + v + r"\g<2>", new_content, flags=re.IGNORECASE)
     return new_content
 
 
 # =========================================================
-# API client abstractions (cPanel + 20i)
+# Base client + implementations
 # =========================================================
 
 class BaseHostingClient:
-    """
-    Abstract base for different hosting providers.
-    Concrete implementations: cPanel, 20i.
-    """
-
     def list_domains(self) -> Dict[str, Any]:
         raise NotImplementedError
 
-    def get_document_root(self, domain: str, domains_data: Dict[str, Any]) -> Optional[str]:
+    def extract_domain_names(self, raw: Dict[str, Any]) -> List[str]:
+        """
+        Try several shapes to find domains and return flat list of domain names.
+        Handles variations in cPanel UAPI DomainInfo::list_domains output.
+        """
+        names: List[str] = []
+
+        # cPanel typical: { "data": { "main_domains": [...], "sub_domains": [...], ... } }
+        data = raw.get("data")
+        if isinstance(data, dict):
+            for key in ["main_domains", "sub_domains", "addon_domains", "parked_domains", "domain"]:
+                value = data.get(key)
+                if isinstance(value, list):
+                    # either list[str] or list[dict]
+                    if value and isinstance(value[0], str):
+                        names.extend(value)
+                    elif value and isinstance(value[0], dict):
+                        for item in value:
+                            d = item.get("domain")
+                            if isinstance(d, str):
+                                names.append(d)
+
+        # fallback: some APIs might just return {"domains": [...]} or similar
+        for key in ["domains", "items"]:
+            v = raw.get(key)
+            if isinstance(v, list):
+                if v and isinstance(v[0], str):
+                    names.extend(v)
+                elif v and isinstance(v[0], dict):
+                    for item in v:
+                        d = item.get("domain") or item.get("name")
+                        if isinstance(d, str):
+                            names.append(d)
+
+        # dedupe
+        return sorted(list({n for n in names if isinstance(n, str) and n.strip()}))
+
+    def get_document_root(self, domain: str, raw: Dict[str, Any]) -> Optional[str]:
         raise NotImplementedError
 
     def upload_file(self, target_dir: str, filename: str, content: bytes) -> Dict[str, Any]:
@@ -113,16 +121,10 @@ class BaseHostingClient:
         raise NotImplementedError
 
     def describe(self) -> str:
-        """Short label for UI."""
         raise NotImplementedError
 
 
 class CPanelAPIClient(BaseHostingClient):
-    """
-    cPanel UAPI client for a single account.
-    Uses Authorization: cpanel <user>:<token>
-    """
-
     def __init__(
         self,
         host: str,
@@ -134,7 +136,6 @@ class CPanelAPIClient(BaseHostingClient):
     ) -> None:
         self.host = host
         self.user = user
-        self.port = port
         self.base_url = f"https://{host}:{port}/execute"
         self.headers = {
             "Authorization": f"cpanel {user}:{token}",
@@ -142,8 +143,6 @@ class CPanelAPIClient(BaseHostingClient):
         }
         self.verify_ssl = verify_ssl
         self.timeout = timeout
-
-    # -------- low-level request --------
 
     def _request(
         self,
@@ -156,62 +155,34 @@ class CPanelAPIClient(BaseHostingClient):
         url = f"{self.base_url}/{module}/{function}"
         try:
             if method == "GET":
-                r = requests.get(
-                    url,
-                    headers=self.headers,
-                    params=data,
-                    verify=self.verify_ssl,
-                    timeout=self.timeout,
-                )
+                r = requests.get(url, headers=self.headers, params=data, verify=self.verify_ssl, timeout=self.timeout)
             else:
-                r = requests.post(
-                    url,
-                    headers=self.headers,
-                    data=data,
-                    files=files,
-                    verify=self.verify_ssl,
-                    timeout=self.timeout,
-                )
+                r = requests.post(url, headers=self.headers, data=data, files=files, verify=self.verify_ssl, timeout=self.timeout)
             r.raise_for_status()
             result = r.json()
             if result.get("status") == 0:
-                msg = (result.get("errors") or ["Unknown cPanel API error"])[0]
-                raise Exception(f"cPanel API error: {msg}")
+                msg = (result.get("errors") or ["Unknown cPanel error"])[0]
+                raise Exception(msg)
             return result
         except Exception as e:
-            raise Exception(f"cPanel request failed ({module}/{function}): {e}")
-
-    # -------- meta --------
-
-    def test_connection(self) -> bool:
-        try:
-            self.list_domains()
-            return True
-        except Exception:
-            return False
-
-    def describe(self) -> str:
-        return f"cPanel @{self.host} ({self.user})"
-
-    # -------- domain / docroot --------
+            raise Exception(f"cPanel request failed: {e}")
 
     def list_domains(self) -> Dict[str, Any]:
         return self._request("DomainInfo", "list_domains")
 
-    def get_document_root(self, domain: str, domains_data: Dict[str, Any]) -> Optional[str]:
-        data = domains_data.get("data", {})
+    def get_document_root(self, domain: str, raw: Dict[str, Any]) -> Optional[str]:
+        data = raw.get("data", {})
         keys = ["main_domains", "sub_domains", "addon_domains", "parked_domains", "domain"]
         items: List[Dict[str, Any]] = []
         for k in keys:
-            if isinstance(data.get(k), list):
-                items.extend(data[k])
+            v = data.get(k)
+            if isinstance(v, list):
+                items.extend([x for x in v if isinstance(x, dict)])
 
-        for d in items:
-            if d.get("domain") == domain:
-                return d.get("documentroot") or d.get("docroot")
+        for entry in items:
+            if entry.get("domain") == domain:
+                return entry.get("documentroot") or entry.get("docroot")
         return None
-
-    # -------- file ops --------
 
     def upload_file(self, target_dir: str, filename: str, content: bytes) -> Dict[str, Any]:
         files = {"file-1": (filename, content)}
@@ -235,8 +206,6 @@ class CPanelAPIClient(BaseHostingClient):
         data = {"path": path, "content": content}
         return self._request("Fileman", "save_file_content", method="POST", data=data)
 
-    # -------- DB ops --------
-
     def _full_name(self, short: str) -> str:
         short = short[:7]
         return f"{self.user}_{short}"
@@ -248,30 +217,25 @@ class CPanelAPIClient(BaseHostingClient):
 
     def create_db_user(self, short_name: str, password: str) -> Tuple[str, Dict[str, Any]]:
         short_name = short_name[:7]
-        res = self._request(
-            "Mysql",
-            "create_user",
-            method="POST",
-            data={"name": short_name, "password": password},
-        )
+        res = self._request("Mysql", "create_user", method="POST", data={"name": short_name, "password": password})
         return self._full_name(short_name), res
 
     def set_db_privileges(self, full_db: str, full_user: str) -> Dict[str, Any]:
         data = {"database": full_db, "user": full_user, "privileges": "ALL"}
         return self._request("Mysql", "set_privileges_on_database", method="POST", data=data)
 
+    def describe(self) -> str:
+        return f"cPanel @{self.host} ({self.user})"
+
 
 class TwentyIAPIClient(BaseHostingClient):
     """
-    20i Reseller API client (simplified).
-
-    - Auth: Authorization: Bearer <base64(api_key or combined_key)>
-    - Base URL: https://api.20i.com/
-    - For the UI, it plugs into same methods as cPanel, but implementations differ.
+    20i-style API client with Bearer base64(api_key).
+    For now, only auth + “no domains” behavior are wired.
     """
 
-    def __init__(self, api_key: str, base_url: str = "https://api.20i.com/") -> None:
-        self.api_key = api_key.strip()
+    def __init__(self, combined_key: str, base_url: str = "https://api.20i.com/") -> None:
+        self.api_key = combined_key.strip()
         self.base_url = base_url.rstrip("/")
         self.headers = {
             "Authorization": make_20i_bearer(self.api_key),
@@ -279,19 +243,10 @@ class TwentyIAPIClient(BaseHostingClient):
             "Content-Type": "application/json",
         }
 
-    def _request(
-        self,
-        path: str,
-        method: str = "GET",
-        params: Optional[Dict[str, Any]] = None,
-        data: Optional[Dict[str, Any]] = None,
-    ) -> Dict[str, Any]:
+    def _request(self, path: str, method: str = "GET") -> Dict[str, Any]:
         url = f"{self.base_url}{path}"
         try:
-            if method == "GET":
-                r = requests.get(url, headers=self.headers, params=params, timeout=30)
-            else:
-                r = requests.post(url, headers=self.headers, params=params, json=data, timeout=30)
+            r = requests.request(method, url, headers=self.headers, timeout=30)
             r.raise_for_status()
             if not r.text:
                 return {}
@@ -299,59 +254,50 @@ class TwentyIAPIClient(BaseHostingClient):
         except Exception as e:
             raise Exception(f"20i API error ({method} {path}): {e}")
 
-    def describe(self) -> str:
-        key_preview = self.api_key[:6] + "..." if self.api_key else "no-key"
-        return f"20i API ({key_preview})"
-
-    # Below are “adapter” methods so the main workflow can treat this like cPanel.
-    # In a real app, you’d call the exact 20i endpoints for domains, hosting, etc.
-
     def list_domains(self) -> Dict[str, Any]:
-        """
-        Example adapter; you would map to:
-        GET /domain or similar 20i endpoint.
-        """
-        # Placeholder structure: adapt to real 20i JSON shape.
-        # For now, return empty; UI will handle lack of domains gracefully.
-        return {"data": {"main_domains": [], "sub_domains": []}}
+        # Placeholder; you will map to real 20i endpoints.
+        # Return an empty structure but explain in UI.
+        return {"data": {}}
 
-    def get_document_root(self, domain: str, domains_data: Dict[str, Any]) -> Optional[str]:
-        # This depends entirely on how 20i exposes hosting docroots.
+    def get_document_root(self, domain: str, raw: Dict[str, Any]) -> Optional[str]:
         return None
 
     def upload_file(self, target_dir: str, filename: str, content: bytes) -> Dict[str, Any]:
-        raise NotImplementedError("File upload not wired for 20i demo client yet.")
+        raise NotImplementedError("Implement 20i file upload here.")
 
     def extract_archive(self, file_path: str, target_dir: str) -> Dict[str, Any]:
-        raise NotImplementedError("Archive extract not wired for 20i demo client yet.")
+        raise NotImplementedError("Implement 20i archive extract here.")
 
     def delete_file(self, file_path: str) -> Dict[str, Any]:
-        raise NotImplementedError("Delete file not wired for 20i demo client yet.")
+        raise NotImplementedError("Implement 20i delete file here.")
 
     def get_file_content(self, path: str) -> str:
-        raise NotImplementedError("get_file_content not wired for 20i demo client yet.")
+        raise NotImplementedError("Implement 20i get_file_content here.")
 
     def save_file_content(self, path: str, content: str) -> Dict[str, Any]:
-        raise NotImplementedError("save_file_content not wired for 20i demo client yet.")
+        raise NotImplementedError("Implement 20i save_file_content here.")
 
     def create_database(self, short_name: str) -> Tuple[str, Dict[str, Any]]:
-        raise NotImplementedError("DB creation not wired for 20i demo client yet.")
+        raise NotImplementedError("Implement 20i DB creation here.")
 
     def create_db_user(self, short_name: str, password: str) -> Tuple[str, Dict[str, Any]]:
-        raise NotImplementedError("DB user creation not wired for 20i demo client yet.")
+        raise NotImplementedError("Implement 20i DB user creation here.")
 
     def set_db_privileges(self, full_db: str, full_user: str) -> Dict[str, Any]:
-        raise NotImplementedError("DB privileges not wired for 20i demo client yet.")
+        raise NotImplementedError("Implement 20i DB privileges here.")
+
+    def describe(self) -> str:
+        return f"20i API ({self.api_key[:8]}...)"
 
 
 # =========================================================
-# Multi-account / multi-provider manager
+# Session + account management
 # =========================================================
 
 def init_session_state() -> None:
     defaults = {
-        "accounts": {},          # name -> dict(meta, client)
-        "active_account": None,  # account name (key)
+        "accounts": {},          # name -> {"client": BaseHostingClient, "domains_data": Dict, "connected": bool}
+        "active_account": None,
         "debug_mode": False,
         "db_details": {},
         "selected_path": "",
@@ -365,175 +311,146 @@ def init_session_state() -> None:
 
 def add_cpanel_account_ui() -> None:
     st.subheader("➕ Add cPanel Account")
-
     with st.expander("Add new cPanel connection"):
-        host = st.text_input("cPanel Host", key="cp_host")
-        user = st.text_input("cPanel Username", key="cp_user")
-        token = st.text_input("cPanel API Token", type="password", key="cp_token")
-        col1, col2 = st.columns(2)
-        with col1:
-            verify_ssl = st.checkbox("Verify SSL", value=False, key="cp_verify_ssl")
-        with col2:
-            port = st.number_input("Port", min_value=1, max_value=65535, value=2083, key="cp_port")
+        host = st.text_input("cPanel host", key="cp_host")
+        user = st.text_input("cPanel username", key="cp_user")
+        token = st.text_input("cPanel API token", type="password", key="cp_token")
+        verify_ssl = st.checkbox("Verify SSL", value=False, key="cp_verify_ssl")
 
-        if st.button("Save cPanel Connection", key="btn_add_cpanel"):
+        if st.button("Save cPanel account"):
             if not (host and user and token):
                 st.warning("Host, user, and token are required.")
                 return
             name = f"{user}@{host}"
-            client = CPanelAPIClient(
-                host=host,
-                user=user,
-                token=token,
-                port=int(port),
-                verify_ssl=verify_ssl,
-            )
+            client = CPanelAPIClient(host=host, user=user, token=token, verify_ssl=verify_ssl)
             st.session_state.accounts[name] = {
-                "type": AuthMethod.CPANEL,
                 "client": client,
                 "domains_data": None,
                 "connected": False,
             }
             st.session_state.active_account = name
-            st.success(f"cPanel account '{name}' added.")
+            st.success(f"Added cPanel account '{name}'.")
 
 
 def add_20i_account_ui() -> None:
-    st.subheader("➕ Add 20i Account / API Key")
-
-    with st.expander("Add new 20i API connection"):
-        general_key = st.text_input("General API key", key="twentyi_general")
-        oauth_key = st.text_input("OAuth client key", key="twentyi_oauth")
-        combined_example = ""
-        if general_key and oauth_key:
-            combined_example = general_key + "+" + oauth_key
+    st.subheader("➕ Add 20i API Account")
+    with st.expander("Add new 20i connection"):
+        general = st.text_input("General API key", key="twentyi_general")
+        oauth = st.text_input("OAuth client key", key="twentyi_oauth")
+        combined_default = f"{general}+{oauth}" if general and oauth else ""
         combined = st.text_input(
-            "Combined key (general+oauth)",
-            value=combined_example,
-            help="Matches your panel format: general+oauth",
+            "Combined API key (general+oauth)",
+            value=combined_default,
             key="twentyi_combined",
+            help="Matches the 'combined API key' format in 20i docs.",
         )
-
-        if st.button("Save 20i Connection", key="btn_add_20i"):
+        if st.button("Save 20i account"):
             if not combined:
-                st.warning("Please provide the combined API key.")
+                st.warning("Please enter a combined API key.")
                 return
             name = f"20i:{combined[:8]}..."
-            client = TwentyIAPIClient(api_key=combined)
+            client = TwentyIAPIClient(combined_key=combined)
             st.session_state.accounts[name] = {
-                "type": AuthMethod.TWENTYI_API,
                 "client": client,
                 "domains_data": None,
                 "connected": False,
             }
             st.session_state.active_account = name
-            st.success(f"20i API account '{name}' added.")
+            st.success(f"Added 20i API account '{name}'.")
 
 
 def sidebar_accounts() -> None:
     st.header("Accounts")
-    accounts = st.session_state.accounts
+    if not st.session_state.accounts:
+        st.info("No accounts configured yet.")
+        return
 
-    if accounts:
-        names = list(accounts.keys())
-        current = st.selectbox("Active account", names, index=names.index(st.session_state.active_account) if st.session_state.active_account in names else 0)
-        st.session_state.active_account = current
-        meta = accounts[current]
-        st.caption(f"Active: {meta['client'].describe()}")
+    names = list(st.session_state.accounts.keys())
+    active_default = 0
+    if st.session_state.active_account in names:
+        active_default = names.index(st.session_state.active_account)
 
-        if st.button("Remove active account"):
-            del st.session_state.accounts[current]
-            st.session_state.active_account = None
-            st.session_state.selected_domain = ""
-            st.session_state.selected_path = ""
-            st.session_state.db_details = {}
-            st.warning(f"Removed account {current}")
-            return
+    current = st.selectbox("Active account", names, index=active_default)
+    st.session_state.active_account = current
+    meta = st.session_state.accounts[current]
+    client: BaseHostingClient = meta["client"]
 
-        st.session_state.debug_mode = st.checkbox(
-            "Debug / dry-run mode",
-            value=st.session_state.debug_mode,
-            help="Simulate destructive actions where possible and show more logging.",
-        )
+    st.caption(client.describe())
 
-        if st.button("Connect / Refresh domains"):
-            client: BaseHostingClient = meta["client"]
-            try:
-                with st.spinner("Fetching domains for this account..."):
-                    domains_data = client.list_domains()
-                meta["domains_data"] = domains_data
-                meta["connected"] = True
-                st.success("Domains retrieved.")
-            except Exception as e:
-                meta["domains_data"] = None
-                meta["connected"] = False
-                st.error(f"Failed to list domains: {e}")
-    else:
-        st.info("No accounts configured yet. Add one below.")
+    st.session_state.debug_mode = st.checkbox(
+        "Debug / dry-run",
+        value=st.session_state.debug_mode,
+        help="Simulate destructive actions and show extra logging.",
+    )
+
+    if st.button("Connect / Refresh domains"):
+        try:
+            with st.spinner("Listing domains for this account..."):
+                raw = client.list_domains()
+            meta["domains_data"] = raw
+            meta["connected"] = True
+            st.success("Domains fetched.")
+            # Show raw for debugging domain shape
+            with st.expander("Raw domains JSON (debug)", expanded=False):
+                st.json(raw)
+        except Exception as e:
+            meta["domains_data"] = None
+            meta["connected"] = False
+            st.error(f"Failed to load domains: {e}")
 
 
 # =========================================================
-# Per-account restore flow (domain → upload → DB → restore)
+# Restore workflow
 # =========================================================
 
-def select_target_location(client: BaseHostingClient, domains_data: Dict[str, Any]) -> Tuple[Optional[str], Optional[str]]:
+def step_select_target(client: BaseHostingClient, raw_domains: Dict[str, Any]) -> Tuple[Optional[str], Optional[str]]:
     st.subheader("1. 🌐 Select Target Location")
 
-    data = domains_data.get("data", {})
-    main_domains = data.get("main_domains", []) or []
-    sub_domains = data.get("sub_domains", []) or []
-
-    def to_names(items):
-        if not items:
-            return []
-        if isinstance(items[0], str):
-            return items
-        return [x.get("domain") for x in items if x.get("domain")]
-
-    main_names = to_names(main_domains)
-    sub_names = to_names(sub_domains)
-    all_domains = main_names + sub_names
-
-    if not all_domains:
-        st.error("No domains returned for this account.")
+    domain_names = client.extract_domain_names(raw_domains)
+    if not domain_names:
+        st.error(
+            "No domains returned for this account. "
+            "Check the domains JSON in the sidebar expander to see what the API is sending."
+        )
         return None, None
 
     choice = st.radio(
-        "Where do you want to restore?",
-        ["Existing Domain/Subdomain", "Create New Subdomain (cPanel only)"],
-        key="restore_choice",
+        "Where should the WordPress site be restored?",
+        ["Existing domain/subdomain", "Create new subdomain (cPanel only)"],
+        key="choice_target",
     )
 
-    selected_domain = None
-    path = None
+    selected_domain: Optional[str] = None
+    docroot: Optional[str] = None
 
-    if choice == "Existing Domain/Subdomain":
-        selected_domain = st.selectbox("Existing domain", all_domains, key="existing_domain")
+    if choice == "Existing domain/subdomain":
+        selected_domain = st.selectbox("Select domain", domain_names, key="existing_domain")
         if selected_domain:
-            path = client.get_document_root(selected_domain, domains_data)
-            if path:
-                st.info(f"Target docroot: `{path}`")
+            docroot = client.get_document_root(selected_domain, raw_domains)
+            if docroot:
+                st.info(f"Document root for {selected_domain}: `{docroot}`")
             else:
-                st.warning("Could not determine document root; check hosting control panel.")
+                st.warning("No document root found. You may have to inspect the server structure manually.")
 
     else:
         if not isinstance(client, CPanelAPIClient):
-            st.warning("Subdomain creation is currently implemented only for cPanel accounts.")
+            st.warning("Subdomain creation is currently supported only for cPanel accounts.")
             return None, None
 
+        main_only = domain_names  # for simplicity assume all are allowed
         col1, col2 = st.columns(2)
         with col1:
-            raw = st.text_input("Subdomain name (e.g., staging)", key="new_sub")
+            raw = st.text_input("Subdomain label (e.g. staging)", key="new_sub_label")
         with col2:
-            base = st.selectbox("Base domain", main_names, key="new_base_domain")
+            base = st.selectbox("Base domain", main_only, key="base_domain")
 
         normalized = normalize_subdomain_name(raw) if raw else ""
         if normalized:
-            st.caption(f"Normalized: `{normalized}`")
+            st.caption(f"Normalized subdomain: `{normalized}`")
 
         if st.button("Create subdomain"):
             if not (normalized and base):
-                st.warning("Subdomain and base domain are required.")
+                st.warning("Subdomain and base domain required.")
             else:
                 docroot = f"public_html/{normalized}"
                 if st.session_state.debug_mode:
@@ -545,18 +462,17 @@ def select_target_location(client: BaseHostingClient, domains_data: Dict[str, An
                         st.error(f"Failed to create subdomain: {e}")
                         return None, None
                 selected_domain = f"{normalized}.{base}"
-                path = docroot
-                st.success(f"Subdomain created: {selected_domain}")
-                st.info(f"Target docroot: `{path}`")
+                st.success(f"Created subdomain {selected_domain}")
+                st.info(f"Docroot: `{docroot}`")
 
-    return selected_domain, path
+    return selected_domain, docroot
 
 
-def upload_backup_zip() -> Optional[BytesIO]:
-    st.subheader("2. 📤 Upload WordPress .zip Backup")
-    up = st.file_uploader("Upload ZIP backup", type=["zip"], key="zip_uploader")
+def step_upload_zip() -> Optional[BytesIO]:
+    st.subheader("2. 📤 Upload WordPress ZIP")
+    up = st.file_uploader("Upload backup .zip", type=["zip"], key="zip_uploader")
     if not up:
-        st.info("Waiting for ZIP file...")
+        st.info("Waiting for a ZIP file...")
         return None
     st.session_state.upload_filename = up.name
     buf = BytesIO(up.read())
@@ -565,67 +481,54 @@ def upload_backup_zip() -> Optional[BytesIO]:
     return buf
 
 
-def configure_database(client: BaseHostingClient, selected_domain: Optional[str]) -> bool:
-    st.subheader("3. 🗄️ Database Configuration")
+def step_configure_db(client: BaseHostingClient, selected_domain: Optional[str]) -> bool:
+    st.subheader("3. 🗄️ Database configuration")
 
     if not st.session_state.db_details:
         base = "wp_site"
         if selected_domain:
             base = selected_domain.split(".")[0].replace("-", "_")[:7] or "wp_site"
         st.session_state.db_details = {
-            "db_short": base,
-            "db_pass": generate_strong_password(),
+            "short": base,
+            "pass": generate_strong_password(),
             "created": False,
         }
 
-    db_short = st.text_input(
-        "Database/User short name (max 7 chars)",
-        value=st.session_state.db_details["db_short"],
-        max_chars=7,
-    )
-    db_pass = st.text_input(
-        "Database user password",
-        value=st.session_state.db_details["db_pass"],
-        type="password",
-    )
-
-    st.session_state.db_details["db_short"] = db_short
-    st.session_state.db_details["db_pass"] = db_pass
+    short = st.text_input("DB/user short name (max 7 chars)", value=st.session_state.db_details["short"], max_chars=7)
+    pwd = st.text_input("DB user password", value=st.session_state.db_details["pass"], type="password")
+    st.session_state.db_details["short"] = short
+    st.session_state.db_details["pass"] = pwd
 
     if isinstance(client, CPanelAPIClient):
-        full_db_name = client._full_name(db_short)  # type: ignore[attr-defined]
-        full_db_user = client._full_name(db_short)  # type: ignore[attr-defined]
-        st.markdown(
-            f"**Full DB name:** `{full_db_name}`  \n"
-            f"**Full DB user:** `{full_db_user}`"
-        )
+        full_db = client._full_name(short)  # type: ignore[attr-defined]
+        full_user = client._full_name(short)  # type: ignore[attr-defined]
+        st.markdown(f"**Will use DB:** `{full_db}`  \n**Will use user:** `{full_user}`")
     else:
-        full_db_name = db_short
-        full_db_user = db_short
-        st.info("DB naming for this provider is generic; customize as needed.")
+        full_db, full_user = short, short
+        st.info("Using generic DB/user names for this provider.")
 
-    if st.button("Create DB + user") or st.session_state.db_details["created"]:
+    if st.button("Create DB and user") or st.session_state.db_details["created"]:
         if not st.session_state.db_details["created"]:
             try:
                 if st.session_state.debug_mode:
-                    st.info("[DRY RUN] Would create DB and DB user, then grant ALL privileges.")
+                    st.info("[DRY RUN] Would create DB, user, and grant privileges.")
                 else:
-                    full_db_name, _ = client.create_database(db_short)
-                    full_db_user, _ = client.create_db_user(db_short, db_pass)
-                    client.set_db_privileges(full_db_name, full_db_user)
+                    full_db, _ = client.create_database(short)
+                    full_user, _ = client.create_db_user(short, pwd)
+                    client.set_db_privileges(full_db, full_user)
 
                 st.session_state.db_details.update(
                     {
                         "created": True,
-                        "full_db_name": full_db_name,
-                        "full_db_user": full_db_user,
-                        "db_pass": db_pass,
+                        "full_db": full_db,
+                        "full_user": full_user,
+                        "pass": pwd,
                     }
                 )
-                st.success("Database and user are ready.")
+                st.success("Database and user ready.")
                 st.experimental_rerun()
             except Exception as e:
-                st.error(f"Database setup failed: {e}")
+                st.error(f"DB setup failed: {e}")
                 return False
         else:
             st.success("Database and user already created.")
@@ -633,56 +536,51 @@ def configure_database(client: BaseHostingClient, selected_domain: Optional[str]
     return bool(st.session_state.db_details.get("created"))
 
 
-def execute_restore(client: BaseHostingClient, buf: BytesIO) -> None:
-    st.subheader("4. ⚙️ Execute Restoration")
+def step_execute_restore(client: BaseHostingClient, buf: BytesIO) -> None:
+    st.subheader("4. ⚙️ Execute restoration")
 
-    selected_domain = st.session_state.selected_domain
-    selected_path = st.session_state.selected_path
+    dom = st.session_state.selected_domain
+    path = st.session_state.selected_path
     dbd = st.session_state.db_details
     debug = st.session_state.debug_mode
     name = st.session_state.upload_filename or "backup.zip"
 
-    if not (selected_domain and selected_path and dbd.get("created")):
-        st.warning("Complete previous steps (domain, upload, DB) first.")
+    if not (dom and path and dbd.get("created")):
+        st.warning("Complete previous steps first.")
         return
 
     progress = st.empty()
 
-    if st.button("Start full restore", key="btn_restore"):
+    if st.button("Start restore"):
         try:
             # 4.1 upload
-            progress.info(f"4.1 Uploading `{name}` to `{selected_path}`...")
+            progress.info(f"4.1 Uploading `{name}` to `{path}`...")
             buf.seek(0)
             if debug:
-                st.info(f"[DRY RUN] Would upload {name} to {selected_path}")
+                st.info(f"[DRY RUN] Would upload {name} to {path}")
             else:
-                client.upload_file(selected_path, name, buf.read())
-            uploaded_path = f"{selected_path}/{name}"
+                client.upload_file(path, name, buf.read())
+            uploaded_path = f"{path}/{name}"
             progress.success("4.1 Upload complete.")
 
             # 4.2 extract
             progress.info("4.2 Extracting archive...")
             if debug:
-                st.info(f"[DRY RUN] Would extract {uploaded_path} into {selected_path}")
+                st.info(f"[DRY RUN] Would extract {uploaded_path} into {path}")
             else:
-                client.extract_archive(uploaded_path, selected_path)
+                client.extract_archive(uploaded_path, path)
             progress.success("4.2 Extraction complete.")
 
             # 4.3 wp-config
-            wp_path = f"{selected_path}/wp-config.php"
-            progress.info(f"4.3 Updating `{wp_path}` with DB credentials...")
+            wp_path = f"{path}/wp-config.php"
+            progress.info(f"4.3 Updating `{wp_path}`...")
             if debug:
                 st.info("[DRY RUN] Would read and patch wp-config.php.")
             else:
                 cfg = client.get_file_content(wp_path)
                 if not cfg:
-                    raise Exception("wp-config.php not found or empty.")
-                new_cfg = update_wp_config(
-                    cfg,
-                    dbd["full_db_name"],
-                    dbd["full_db_user"],
-                    dbd["db_pass"],
-                )
+                    raise Exception("wp-config.php missing or empty.")
+                new_cfg = update_wp_config(cfg, dbd["full_db"], dbd["full_user"], dbd["pass"])
                 client.save_file_content(wp_path, new_cfg)
             progress.success("4.3 wp-config.php updated.")
 
@@ -696,75 +594,70 @@ def execute_restore(client: BaseHostingClient, buf: BytesIO) -> None:
 
             st.balloons()
             st.success(
-                f"""
-                ## 🎉 Restore finished for {selected_domain}
-
-                1. Import your SQL dump into `{dbd["full_db_name"]}`.
-                2. In `wp_options`, set `siteurl` and `home` to your final URL.
-                3. Test frontend and wp-admin.
-                """
+                f"🎉 Restore complete for {dom}\n\n"
+                f"Import your SQL into `{dbd['full_db']}` and update `siteurl`/`home` in `wp_options`."
             )
         except Exception as e:
-            progress.error(f"❌ Restore failed: {e}")
+            progress.error(f"Restore failed: {e}")
 
 
 # =========================================================
-# Main Streamlit app
+# Main app
 # =========================================================
 
 def main() -> None:
     st.set_page_config(
-        page_title="Multi-Account WordPress Restore (cPanel + 20i-style)",
+        page_title="Multi-Account WP Restore",
         layout="wide",
         page_icon="🚀",
     )
     init_session_state()
 
-    st.title("🚀 Multi-Account WordPress Restore")
-    st.markdown(
-        "Connect to multiple hosting backends (cPanel now, 20i-style auth wired for later) "
-        "and run a guided WordPress restore from a ZIP backup."
+    st.title("🚀 Multi-Account WordPress Restore (cPanel + 20i auth format)")
+    st.write(
+        "Restore WordPress backups across multiple hosting accounts. "
+        "Supports cPanel UAPI directly and accepts 20i-style Bearer auth for future extension."
     )
     st.markdown("---")
 
-    # Sidebar: account manager
     with st.sidebar:
         sidebar_accounts()
         st.markdown("---")
         add_cpanel_account_ui()
         add_20i_account_ui()
 
-    # Main workflow uses active account
     if not st.session_state.accounts or not st.session_state.active_account:
-        st.info("Add and select an account on the left to start.")
+        st.info("Add and select an account from the sidebar.")
         return
 
     meta = st.session_state.accounts[st.session_state.active_account]
     client: BaseHostingClient = meta["client"]
 
     if not meta.get("connected") or meta.get("domains_data") is None:
-        st.warning("Connect / refresh domains for this account using the sidebar.")
+        st.warning("Click 'Connect / Refresh domains' in the sidebar for the active account.")
         return
 
-    # Step 1: select domain / docroot
-    selected_domain, selected_path = select_target_location(client, meta["domains_data"])
-    if not selected_path:
+    raw_domains = meta["domains_data"]
+
+    # Step 1
+    selected_domain, docroot = step_select_target(client, raw_domains)
+    if not docroot:
         st.warning("Select or create a valid target first.")
         return
     st.session_state.selected_domain = selected_domain
-    st.session_state.selected_path = selected_path
+    st.session_state.selected_path = docroot
 
-    # Step 2: upload backup
-    buf = upload_backup_zip()
+    # Step 2
+    buf = step_upload_zip()
     if not buf:
         return
 
-    # Step 3: DB config
-    if not configure_database(client, selected_domain):
+    # Step 3
+    if not step_configure_db(client, selected_domain):
         return
 
-    # Step 4: restore
-    execute_restore(client, buf)
+    # Step 4
+    step_execute_restore(client, buf)
 
 
 if __name__ == "__main__":
